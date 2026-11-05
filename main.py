@@ -13,13 +13,18 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
-import sys, os, json, math, random, struct, array
+import sys, os, json, math, random
 
 # ─── PyInstaller bundle resource path ────────────────────────────────────────
 if getattr(sys, "frozen", False):
-    _BASE = sys._MEIPASS  # type: ignore[attr-defined]
+    # PyInstaller EXE: resurs fayllari _MEIPASS ichida,
+    # lekin foydalanuvchi data (save fayllar) EXE ning yonida saqlanadi
+    _BASE      = sys._MEIPASS       # type: ignore[attr-defined]
+    _USER_BASE = os.path.dirname(sys.executable)
 else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
+    _BASE      = os.path.dirname(os.path.abspath(__file__))
+    _USER_BASE = _BASE
+
 os.chdir(_BASE)
 sys.path.insert(0, _BASE)
 
@@ -77,10 +82,10 @@ PU_LASER  = "laser"
 PU_ALL    = [PU_SHIELD, PU_DOUBLE, PU_SLOW, PU_LIFE, PU_NUKE, PU_SPEED, PU_LASER]
 PU_WEIGHTS= [18,        16,        16,      12,       8,        14,       10     ]
 
-# Data fayllar
-_DATA_DIR    = os.path.join(_BASE, "data")
-HS_FILE      = os.path.join(_DATA_DIR, "highscores.json")
-SETT_FILE    = os.path.join(_DATA_DIR, "settings.json")
+# Data fayllar — EXE yonida yoziladi (foydalanuvchi ma'lumotlari)
+_DATA_DIR = os.path.join(_USER_BASE, "data")
+HS_FILE   = os.path.join(_DATA_DIR, "highscores.json")
+SETT_FILE = os.path.join(_DATA_DIR, "settings.json")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -165,22 +170,28 @@ def save_settings(d):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SINTETIK OVOZ GENERATORI
+#  SINTETIK OVOZ GENERATORI  (numpy-siz, PyInstaller bilan 100% mos)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _stereo(mono_list):
-    """16-bit mono list → pygame.mixer.Sound (stereo)"""
-    buf = array.array("h")
-    for s in mono_list:
-        v = max(-32768, min(32767, int(s)))
-        buf.append(v); buf.append(v)
+    """
+    16-bit mono qiymatlar ro'yxatini pygame.mixer.Sound ga aylantiradi.
+    numpy va pygame.sndarray ISHLATILMAYDI — PyInstaller uchun xavfsiz.
+    """
     try:
-        return pygame.sndarray.make_sound(
-            pygame.sndarray.array(
-                pygame.mixer.Sound(buffer=buf.tobytes()).get_raw()
-            ).reshape((-1,2))
-        )
-    except:
+        # struct.pack bilan stereo interleaved bytes yaratamiz
+        buf = bytearray(len(mono_list) * 4)  # har sample: L(2B) + R(2B)
+        for i, s in enumerate(mono_list):
+            v = max(-32768, min(32767, int(s)))
+            lo = v & 0xFF
+            hi = (v >> 8) & 0xFF
+            base = i * 4
+            buf[base]     = lo   # L lo
+            buf[base + 1] = hi   # L hi
+            buf[base + 2] = lo   # R lo
+            buf[base + 3] = hi   # R hi
+        return pygame.mixer.Sound(buffer=bytes(buf))
+    except Exception:
         return None
 
 def gen_shoot():
@@ -250,48 +261,64 @@ def gen_victory():
     return _stereo(buf)
 
 def gen_bg_music():
-    """Ambient lo-fi background musiqa (12 soniya loop)"""
-    sr=44100; dur=12.0; n=int(sr*dur)
-    import array as _a
-    buf = _a.array("h", [0]*n*2)
+    """Ambient lo-fi background musiqa (12 soniya loop).
+    numpy va sndarray ishlatilmaydi — bytearray bilan to'g'ridan-to'g'ri."""
+    sr = 44100; dur = 6.0; n = int(sr * dur)   # 6s loop (kichikroq, tezroq)
+    # Stereo interleaved bytearray: L_lo, L_hi, R_lo, R_hi
+    buf = [0] * (n * 2)  # int16 stereo pairs (n sample * 2 channel)
+
+    def add(idx, v):
+        cur = buf[idx]
+        buf[idx] = max(-32768, min(32767, cur + max(-32768, min(32767, int(v)))))
+
     pad_freqs = [130.8, 174.6, 261.6]
     for freq in pad_freqs:
         for i in range(n):
-            t=i/sr
-            v = (math.sin(2*math.pi*freq*t)*0.07
-                 + math.sin(2*math.pi*freq*2.001*t)*0.035
-                 + math.sin(2*math.pi*freq*3.002*t)*0.018)
-            v *= 0.8+0.2*math.sin(2*math.pi*0.4*t)
-            s = max(-32768, min(32767, int(v*32767)))
-            buf[i*2]   = max(-32768,min(32767, buf[i*2]+s))
-            buf[i*2+1] = max(-32768,min(32767, buf[i*2+1]+s))
-    kick_int = int(sr*0.5)
+            t = i / sr
+            v = (math.sin(2 * math.pi * freq * t) * 0.07
+                 + math.sin(2 * math.pi * freq * 2.001 * t) * 0.035
+                 + math.sin(2 * math.pi * freq * 3.002 * t) * 0.018)
+            v *= 0.8 + 0.2 * math.sin(2 * math.pi * 0.4 * t)
+            s = int(v * 32767)
+            add(i * 2,     s)
+            add(i * 2 + 1, s)
+
+    # Kick
+    kick_int = int(sr * 0.5)
     for ks in range(0, n, kick_int):
-        for j in range(min(int(sr*0.08), n-ks)):
-            f_k=80*(0.01**(j/sr/0.08))
-            env=max(0.0,1.0-j/(sr*0.08))**2
-            s=max(-32768,min(32767,int(math.sin(2*math.pi*f_k*j/sr)*env*0.12*32767)))
-            idx=ks+j
-            if idx<n:
-                buf[idx*2]=max(-32768,min(32767,buf[idx*2]+s))
-                buf[idx*2+1]=max(-32768,min(32767,buf[idx*2+1]+s))
-    hat_int = int(sr*0.25)
-    for hs in range(hat_int//2, n, hat_int):
-        for j in range(min(int(sr*0.02), n-hs)):
-            noise=random.randint(-800,800)
-            env=max(0.0,1.0-j/(sr*0.02))
-            s=max(-32768,min(32767,int(noise*env)))
-            idx=hs+j
-            if idx<n:
-                buf[idx*2]=max(-32768,min(32767,buf[idx*2]+s))
-                buf[idx*2+1]=max(-32768,min(32767,buf[idx*2+1]+s))
+        for j in range(min(int(sr * 0.08), n - ks)):
+            f_k = 80 * (0.01 ** (j / max(1, sr * 0.08)))
+            env = max(0.0, 1.0 - j / max(1, sr * 0.08)) ** 2
+            s = int(math.sin(2 * math.pi * f_k * j / sr) * env * 0.12 * 32767)
+            idx = ks + j
+            if idx < n:
+                add(idx * 2,     s)
+                add(idx * 2 + 1, s)
+
+    # Hi-hat
+    hat_int = int(sr * 0.25)
+    for hs_ in range(hat_int // 2, n, hat_int):
+        for j in range(min(int(sr * 0.02), n - hs_)):
+            noise = random.randint(-800, 800)
+            env = max(0.0, 1.0 - j / max(1, sr * 0.02))
+            s = int(noise * env)
+            idx = hs_ + j
+            if idx < n:
+                add(idx * 2,     s)
+                add(idx * 2 + 1, s)
+
     try:
-        snd = pygame.sndarray.make_sound(
-            pygame.sndarray.array(pygame.mixer.Sound(buffer=buf.tobytes()).get_raw()).reshape((-1,2))
-        )
-        return snd
-    except:
+        # bytearray ga o'tkazish (int16 little-endian, stereo)
+        raw = bytearray(n * 4)  # n sample * 2 channel * 2 byte
+        for i, v in enumerate(buf):
+            v = max(-32768, min(32767, v))
+            raw[i * 2]     = v & 0xFF
+            raw[i * 2 + 1] = (v >> 8) & 0xFF
+        return pygame.mixer.Sound(buffer=bytes(raw))
+    except Exception:
         return None
+
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -942,8 +969,17 @@ BOSS_INTERVAL=1000
 
 class Game:
     def __init__(self):
+        pygame.mixer.pre_init(44100, -16, 2, 512)
         pygame.init()
-        pygame.mixer.init(44100,-16,2,512)
+        # Mixer qayta initsializatsiya (pre_init dan keyin ham kerak bo'lishi mumkin)
+        if not pygame.mixer.get_init():
+            try:
+                pygame.mixer.init(44100, -16, 2, 512)
+            except pygame.error:
+                try:
+                    pygame.mixer.init()
+                except pygame.error:
+                    pass  # Ovoz bo'lmasa ham o'yin ishlaydi
 
         self._settings=load_settings()
         self._hs=load_hs()
@@ -973,13 +1009,22 @@ class Game:
         snd.init(self._sounds, self._settings)
         self._snd=snd
 
-        # Fontlar
-        self._fhuge=pygame.font.SysFont("Arial Black",80,bold=True)
-        self._fbig =pygame.font.SysFont("Arial",48,bold=True)
-        self._fmed =pygame.font.SysFont("Arial",30)
-        self._fsml =pygame.font.SysFont("Arial",22)
-        self._ftny =pygame.font.SysFont("Arial",16)
-        self._fwave=pygame.font.SysFont("Arial Black",76,bold=True)
+        # Fontlar — "Arial Black" yo'q bo'lsa fallback
+        def _font(name, size, bold=False):
+            try:
+                f = pygame.font.SysFont(name, size, bold=bold)
+                # Test qilamiz
+                f.render("T", True, (255,255,255))
+                return f
+            except Exception:
+                return pygame.font.SysFont("Arial", size, bold=True)
+
+        self._fhuge = _font("Arial Black", 80, bold=True)
+        self._fbig  = _font("Arial", 48, bold=True)
+        self._fmed  = _font("Arial", 30)
+        self._fsml  = _font("Arial", 22)
+        self._ftny  = _font("Arial", 16)
+        self._fwave = _font("Arial Black", 76, bold=True)
 
         # Yulduzlar
         self._stars=[Star(initial=True) for _ in range(160)]
@@ -1037,9 +1082,13 @@ class Game:
                  "shield":gen_shield,"nuke":gen_nuke,"levelup":gen_levelup,
                  "tick":gen_tick,"combo":gen_combo,"victory":gen_victory}
         self._sounds={}
-        for name,fn in recipes.items():
-            try: self._sounds[name]=fn()
-            except: self._sounds[name]=None
+        # Mixer initsializatsiya bo'lmagan bo'lsa ovozlarni yaratmaymiz
+        if pygame.mixer.get_init():
+            for name,fn in recipes.items():
+                try: self._sounds[name]=fn()
+                except Exception: self._sounds[name]=None
+        else:
+            for name in recipes: self._sounds[name]=None
 
     # ── MENYULAR ────────────────────────────────────────────────────────────
 
